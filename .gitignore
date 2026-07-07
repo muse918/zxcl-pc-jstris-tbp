@@ -1,0 +1,11 @@
+/target
+# large raw data (regenerate via scripts/); only the gzipped dist assets are committed
+*.f32.bin
+v_pi2_*.bin
+l0_*.bin
+/tmp/
+
+# generated artifacts (build.sh reproduces them)
+dist/pcbot/*.wasm
+webtest/zxcl_main.js
+webtest/zxcl_tbp_bg.wasm

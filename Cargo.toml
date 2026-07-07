@@ -1,0 +1,18 @@
+[package]
+name = "pcbot_wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+hashbrown = "0.14"
+rayon = "1"
+miniz_oxide = "0.8"   # pure-Rust inflate for the wasm-embedded (zlib) data blobs
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

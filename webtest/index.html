@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>zxcl — standalone PC test</title>
+<style>
+  body { background:#0d0f14; color:#cdd3dc; font:14px/1.5 system-ui,sans-serif; margin:0; padding:20px; }
+  h1 { font-size:16px; margin:0 0 12px; color:#8fb3ff; }
+  .wrap { display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap; }
+  canvas { background:#0d0f14; border:1px solid #2a2f3a; }
+  .panel { min-width:220px; }
+  .row { margin:6px 0; }
+  .k { color:#7b8494; display:inline-block; width:70px; }
+  .v { color:#e8edf4; font-weight:600; }
+  button { background:#2b6cff; color:#fff; border:0; border-radius:6px; padding:7px 14px; font-weight:600; cursor:pointer; margin-right:6px; }
+  button.stop { background:#3a4150; }
+  input[type=number]{ width:120px; background:#161a22; color:#e8edf4; border:1px solid #2a2f3a; border-radius:5px; padding:4px 6px; }
+  input[type=range]{ vertical-align:middle; }
+  #hold { font-size:20px; font-weight:800; }
+  #queue .qp { font-size:20px; font-weight:800; margin-right:8px; }
+  #status { margin:10px 0; color:#7b8494; }
+  #status.err { color:#ff6b6b; font-weight:600; }
+  #think { color:#ffcf5c; font-weight:600; height:18px; }
+  .hint { color:#6a7280; font-size:12px; margin-top:14px; max-width:340px; }
+</style>
+<h1>zxcl — standalone perpetual-PC test (no jstris, no network)</h1>
+<div class="wrap">
+  <div>
+    <canvas id="canvas"></canvas>
+    <div id="think"></div>
+  </div>
+  <div class="panel">
+    <div class="row"><span class="k">Hold</span> <span id="hold" class="v">-</span></div>
+    <div class="row"><span class="k">Next</span> <span id="queue" class="v"></span></div>
+    <hr style="border:0;border-top:1px solid #2a2f3a;margin:12px 0">
+    <div class="row"><span class="k">PCs</span> <span id="pcs" class="v">0</span></div>
+    <div class="row"><span class="k">Pieces</span> <span id="pieces" class="v">0</span></div>
+    <div class="row"><span class="k">Time</span> <span id="time" class="v">0s</span></div>
+    <div class="row"><span class="k">PPS</span> <span id="pps" class="v">0</span></div>
+    <hr style="border:0;border-top:1px solid #2a2f3a;margin:12px 0">
+    <div class="row"><span class="k">Seed</span> <input id="seed" type="number" value="1"></div>
+    <div class="row"><span class="k">Delay</span> <input id="speed" type="range" min="0" max="1000" value="250"> <span id="speedLabel">250ms</span></div>
+    <div class="row" style="margin-top:12px">
+      <button id="btnStart">Start</button>
+      <button id="btnStop" class="stop">Stop</button>
+    </div>
+    <div id="status">loading worker…</div>
+    <div class="hint">Drives the real zxcl worker over the TBP protocol (start / suggest / play /
+      new_piece) against a self-generated 7-bag, and renders each placement. The first move of every
+      PC runs the full boundary search (~15–25 s single-threaded in wasm); later moves are instant.</div>
+  </div>
+</div>
+<script src="host.js"></script>

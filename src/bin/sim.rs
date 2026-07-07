@@ -1,0 +1,205 @@
+//! Native TBP-flow simulator: drives bot::Bot exactly like the jstris host would
+//! (start -> suggest -> play -> new_piece ...), against a self-generated 7-bag stream, with an
+//! independent physical board simulation to verify every emitted move:
+//!   - the (piece, orient, x, y) TBP move is decoded back to cells via the center-offset table,
+//!   - the cells must be reachable placements on the current physical board,
+//!   - line clears are applied physically and compared against the bot's internal board hash.
+//! usage: sim --proj F --values F [--pcs N] [--seed S] [--previews K (queue len incl active)]
+
+use pcbot_wasm::bot::{Bot, ORIENT_NAMES};
+use pcbot_wasm::movegen;
+use pcbot_wasm::piece::piece_char;
+use pcbot_wasm::proj::ProjFilter;
+use pcbot_wasm::tbpcoord;
+use pcbot_wasm::values::ValueTable;
+
+struct Bag {
+    rng: u64,
+    left: Vec<u8>,
+}
+impl Bag {
+    fn next(&mut self) -> u8 {
+        if self.left.is_empty() {
+            self.left = (0..7).collect();
+        }
+        self.rng ^= self.rng >> 12;
+        self.rng ^= self.rng << 25;
+        self.rng ^= self.rng >> 27;
+        let i = (self.rng.wrapping_mul(0x2545F4914F6CDD1D) >> 33) as usize % self.left.len();
+        self.left.swap_remove(i)
+    }
+}
+
+/// Physical board: 40-bit occupancy in SCREEN coords (bit = r*10 + c, r0 bottom, c0 left).
+struct Phys {
+    cells: u64,
+}
+impl Phys {
+    fn to_engine_hash(&self) -> u64 {
+        // engine hash bit = r*10 + (9-c)
+        let mut h = 0u64;
+        for r in 0..4u64 {
+            for c in 0..10u64 {
+                if self.cells >> (r * 10 + c) & 1 != 0 {
+                    h |= 1 << (r * 10 + (9 - c));
+                }
+            }
+        }
+        h
+    }
+    fn board_cells(&self) -> [u8; 400] {
+        let mut b = [0u8; 400];
+        for i in 0..40 {
+            if self.cells >> i & 1 != 0 {
+                b[i] = 1;
+            }
+        }
+        b
+    }
+    /// Apply a placement given by absolute screen cells; clear full rows. Returns rows cleared.
+    fn place(&mut self, cells4: [u8; 4]) -> u32 {
+        for &b in &cells4 {
+            assert_eq!(self.cells >> b & 1, 0, "cell overlap at {}", b);
+            self.cells |= 1u64 << b;
+        }
+        let mut out = 0u64;
+        let mut dst = 0;
+        let mut cleared = 0;
+        for r in 0..4 {
+            let row = (self.cells >> (r * 10)) & 0b1111111111;
+            if row == 0b1111111111 {
+                cleared += 1;
+            } else {
+                out |= row << (dst * 10);
+                dst += 1;
+            }
+        }
+        self.cells = out;
+        cleared
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let get = |name: &str| -> Option<String> {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let proj_path = get("--proj").expect("--proj required");
+    let values_path = get("--values").expect("--values required");
+    let pcs_target: usize = get("--pcs").and_then(|s| s.parse().ok()).unwrap_or(10);
+    let seed: u64 = get("--seed").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let previews: usize = get("--previews").and_then(|s| s.parse().ok()).unwrap_or(7);
+
+    let mut proj = ProjFilter::load(&proj_path).expect("load proj");
+    // --projext F: attach the supplementary PCPRJX1 projection(s) the shipped bot embeds, so the
+    // simulator matches the deployed filter exactly.
+    if let Some(p) = get("--projext") {
+        let n = proj.attach_extra(&std::fs::read(&p).expect("read projext")).expect("attach extra");
+        eprintln!("attached {} extra projections from {}", n, p);
+    }
+    let table = ValueTable::load(std::path::Path::new(&values_path)).expect("load values");
+    let mut bot = Bot::new(proj, table);
+
+    let mut bag = Bag { rng: seed.max(1), left: Vec::new() };
+    let mut host_queue: Vec<u8> = (0..previews).map(|_| bag.next()).collect();
+    let mut host_hold: Option<u8> = None;
+    let mut phys = Phys { cells: 0 };
+
+    // start
+    bot.start(None, &host_queue, &phys.board_cells(), 0);
+
+    let mut pcs_done = 0usize;
+    let mut placements = 0usize;
+    let mut t_total = 0f64;
+    let mut t_boundary_max = 0f64;
+    while pcs_done < pcs_target {
+        // suggest
+        let t0 = std::time::Instant::now();
+        let Some(mv) = bot.suggest() else {
+            panic!(
+                "bot returned no move after {} placements, {} PCs: {}",
+                placements, pcs_done, bot.last_error
+            );
+        };
+        let dt = t0.elapsed().as_secs_f64();
+        t_total += dt;
+        if dt > t_boundary_max {
+            t_boundary_max = dt;
+        }
+
+        // --- host-side validation ---
+        // hold inference exactly like jstris: piece type != active -> hold swap
+        let active = host_queue[0];
+        if mv.piece == active {
+            host_queue.remove(0);
+        } else if host_hold == Some(mv.piece) {
+            host_hold = Some(host_queue.remove(0));
+        } else if host_hold.is_none() {
+            host_hold = Some(host_queue.remove(0));
+            assert_eq!(host_queue[0], mv.piece, "queue desync: move piece unavailable");
+            host_queue.remove(0);
+        } else {
+            panic!("queue desync: move piece {} not active/hold", piece_char(mv.piece));
+        }
+
+        // Decode the emitted TBP move with the libtetris-exact table (INDEPENDENT of how the bot
+        // produced it) into absolute physical cells, then verify those cells are a reachable,
+        // supported placement on the current physical board.
+        let engine_hash = phys.to_engine_hash();
+        let sunk = {
+            let mut k = 0i8;
+            while k < 4 && (engine_hash >> (10 * k as u64)) & 0b1111111111 == 0b1111111111 { k += 1; }
+            k
+        };
+        let dec = tbpcoord::decode(mv.piece, mv.orient, mv.x, mv.y); // (col, row) screen, physical
+        let mut cells4 = [0u8; 4];
+        for (i, &(c, r)) in dec.iter().enumerate() {
+            assert!(c >= 0 && c < 10 && r >= 0 && r < 4, "decoded cell OOB: c{} r{}", c, r);
+            cells4[i] = (r as u8) * 10 + c as u8;
+        }
+        // reachability: some engine placement must produce these exact cells (engine row = phys+sunk)
+        let want_eng: std::collections::HashSet<(i8, i8)> = dec.iter().map(|&(c, r)| (c, r + sunk)).collect();
+        let reachable = movegen::placements(mv.piece as usize, engine_hash)
+            .iter()
+            .any(|p| p.cells.iter().copied().collect::<std::collections::HashSet<_>>() == want_eng);
+        assert!(
+            reachable,
+            "emitted move not a reachable placement: {} {} x{} y{} cells {:?}",
+            piece_char(mv.piece), ORIENT_NAMES[mv.orient as usize], mv.x, mv.y, dec
+        );
+        let cleared = phys.place(cells4);
+
+        // feed play + new_piece(s) like the host
+        bot.play();
+        let consumed = if mv.piece == active { 1 } else if host_hold == Some(active) { 1 } else { 2 };
+        let _ = consumed; // new_piece count actually equals pieces removed from host_queue this turn
+        while host_queue.len() < previews {
+            let p = bag.next();
+            host_queue.push(p);
+            bot.new_piece(p);
+        }
+
+        placements += 1;
+        if phys.cells == 0 {
+            pcs_done += 1;
+            if cleared > 0 {
+                // fine: 4LPC finishes with a clear; 2LPC likewise
+            }
+            println!(
+                "PC {:3} done at placement {:4}  (max suggest {:6.2}s)",
+                pcs_done, placements, t_boundary_max
+            );
+            t_boundary_max = 0.0;
+        }
+        assert!(placements < pcs_target * 12 + 50, "too many placements without completing PCs");
+    }
+    println!(
+        "\nOK: {} PCs in {} placements | suggest total {:.1}s avg/PC {:.2}s",
+        pcs_done,
+        placements,
+        t_total,
+        t_total / pcs_done as f64
+    );
+}
+
+
