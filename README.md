@@ -10,7 +10,7 @@ zlib-compressed and embedded inside the wasm):
 
 ```
 zxcl_main.js        worker entrypoint (plain JS, no wasm-bindgen)
-zxcl_tbp_bg.wasm    engine + embedded data (~1.05 MB; gzips on transport to ~0.83 MB)
+zxcl_tbp_bg.wasm    engine + embedded data (~0.95 MB; gzips on transport to ~0.82 MB)
 ```
 
 ---
@@ -26,7 +26,7 @@ public/js/bots/tbp/pcbot/zxcl_main.js
 public/js/bots/tbp/pcbot/zxcl_tbp_bg.wasm
 ```
 
-Serve the `.wasm` with `Content-Type: application/wasm` (and gzip for the ~0.83 MB transfer).
+Serve the `.wasm` with `Content-Type: application/wasm` (and gzip for the ~0.82 MB transfer).
 `zxcl_main.js` fetches the wasm relative to itself and calls `tbp_init_embedded()`, which inflates
 its own tables — nothing else to host.
 
@@ -78,6 +78,14 @@ move of each game forfeits; from the second PC on, hold is occupied and 5 previe
   mid-loop resync) the bot forfeits cleanly (`moves: []`).
 - Assumes **7-bag** and SRS. `spin` is always `"none"`; hold is expressed implicitly by the piece
   type (the host infers it).
+- **See-7 information discipline**: at any decision the bot acts only on hold + 6 previews + one
+  reveal per placement already made; pieces the host delivers beyond that window are never read —
+  the search averages over them (in-loop fold tables, w4/w2 next-boundary expectation).
+- The deal stream is validated against the 7-bag model (every 7-aligned window must be a
+  permutation; every reveal must be in the remaining bag). A violation — non-7-bag randomizer or
+  a host/stream desync — forfeits with a precise `bag desync` / `not a 7-bag permutation` reason
+  in `last_error` instead of misplaying. A genuinely dead reveal sequence (no PC continuation;
+  ~1/4000 loops) forfeits as `dead reveal`.
 - Move coordinates match **Cold Clear / libtetris exactly** (the reference jstris expects):
   SRS-true-rotation center cell, x from the left, y from the bottom; O canonicalized to north, S/Z/I
   to north/west. Cleared lines are handled (the engine's sunk-row normalization is translated back).
@@ -96,14 +104,20 @@ cargo build --release         # native lib + sim + tests
 ```
 
 `build.sh` compiles the wasm (which `include_bytes!`s the three zlib blobs in `data/`) and copies
-the two deploy files into `dist/pcbot/` (and into `webtest/` for the local harness).
+the two deploy files into `dist/pcbot/` (and into `webtest/` for the local harness). If
+[`wasm-opt`](https://github.com/WebAssembly/binaryen) (binaryen) is on `PATH` it is applied at
+`-O3` for a ~2.5% smaller binary; without it the raw cargo output ships and is functionally
+identical. rayon (the optional parallel build/solve) is a **native-only** dependency — the wasm
+target is single-threaded and never fetches, compiles, or links it.
 
 ## Verification
 
 - Native simulator (drives the exact TBP flow with an INDEPENDENT physical-board check of every
   emitted move, hold inference, line clears, 4L+2L PCs):
   `cargo run --release --bin sim -- --proj <proj> --values <values> --pcs N --seed S`
-  (add `--projext <proj_ext>` to match the deployed supplementary projection).
+  (add `--projext <proj_ext>` to match the deployed supplementary projection; `--rounds R` for
+  jstris-style round restarts; `--corrupt-deal K --expect-giveup` to verify a broken randomizer
+  is met with a precise bag-desync forfeit, not a misplay).
 - Node smoke on the real wasm: `node js/node_smoke.js dist/pcbot/zxcl_tbp_bg.wasm [pcs] [seed]`.
 - Coordinate round-trip unit tests: `cargo test`.
 - Local visual harness (no jstris, no network): `cd webtest && python3 serve.py` → open

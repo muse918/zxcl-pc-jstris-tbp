@@ -14,7 +14,29 @@
 //!   - retained tables for policy walks (sample play) and best-first-move reports.
 
 use hashbrown::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
+
+/// Collect `slice.par_iter().<m>(body)` when `par` (native only), else `slice.iter().<m>(body)`.
+/// On wasm the parallel arm is cfg'd out entirely — the deployed bot never enables `par_edge`, so
+/// rayon is neither referenced nor linked into the wasm binary.
+macro_rules! par_or_serial {
+    ($par:expr, $slice:expr, $m:ident, $body:expr) => {{
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if $par {
+                $slice.par_iter().$m($body).collect()
+            } else {
+                $slice.iter().$m($body).collect()
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = $par;
+            $slice.iter().$m($body).collect()
+        }
+    }};
+}
 
 // std::time::Instant panics on wasm32-unknown-unknown; the timings are diagnostics only.
 #[cfg(not(target_arch = "wasm32"))]
@@ -259,11 +281,7 @@ pub fn value_search(mut input: SearchInput<'_>) -> VsResult {
             if dst.is_empty() { None } else { Some((parent_id, dst)) }
         };
         let layer = &dag.layers[depth as usize];
-        let pairs: Vec<(NodeId, ValVec)> = if par {
-            layer.par_iter().filter_map(compute).collect()
-        } else {
-            layer.iter().filter_map(compute).collect()
-        };
+        let pairs: Vec<(NodeId, ValVec)> = par_or_serial!(par, layer, filter_map, compute);
         let mut next: ValTable = ValTable::with_capacity(pairs.len());
         for (pid, v) in pairs {
             next.insert(pid, v);
@@ -356,11 +374,7 @@ pub fn value_search(mut input: SearchInput<'_>) -> VsResult {
             (parent_id, best.into_iter().collect())
         };
         let layer = &dag.layers[3];
-        let results: Vec<(NodeId, Vec<(u16, f64)>)> = if par {
-            layer.par_iter().map(compute).collect()
-        } else {
-            layer.iter().map(compute).collect()
-        };
+        let results: Vec<(NodeId, Vec<(u16, f64)>)> = par_or_serial!(par, layer, map, compute);
         let out = &mut folds[3];
         for (pid, list) in results {
             for (p3, val) in list {
@@ -714,6 +728,8 @@ fn build_dag(
     initial_mask: u8,
     two_line_field: u64,
 ) -> Dag {
+    #[cfg(target_arch = "wasm32")]
+    let _ = &par_edge; // parallel build is native-only; keep the signature stable across targets
     let mut dag = Dag {
         nodes: Vec::new(),
         layers: vec![Vec::new(); 11],
@@ -745,41 +761,42 @@ fn build_dag(
     for depth in 0..10u8 {
         let child_depth = depth + 1;
         let frontier = dag.layers[depth as usize].clone();
-        match par_edge {
-            // PARALLEL BUILD: Phase A (rayon) computes each frontier node's child triples via the
-            // Sync edge source (movegen is the cost, read-only). Phase B inserts them SERIALLY in
-            // the identical frontier/child order, so NodeIds — and thus the whole DAG — are exactly
-            // as the serial build would produce (bit-identical result, just faster).
-            Some(pe) => {
-                let all: Vec<Vec<(u64, Piece, u8)>> = frontier
-                    .par_iter()
-                    .map(|&id| {
-                        let key = dag.nodes[id].key;
-                        let mut k = Vec::new();
-                        let mut h = Vec::new();
-                        let mut o = Vec::new();
-                        node_child_triples(key, &visible, two_line_field, &|f, p, b| pe(f, p, b), &mut k, &mut h, &mut o);
-                        o
-                    })
-                    .collect();
-                for (&id, tr) in frontier.iter().zip(all.iter()) {
-                    let mut edges = Vec::with_capacity(tr.len());
-                    for &(nf, nh, nm) in tr {
-                        edges.push(get_or_add_node(&mut dag, NodeKey { depth: child_depth, field: nf, hold: nh, mask: nm }));
-                    }
-                    dag.nodes[id].edges = edges;
-                }
-            }
-            None => {
-                for id in frontier {
+        // PARALLEL BUILD (native only): Phase A (rayon) computes each frontier node's child triples
+        // via the Sync edge source (movegen is the cost, read-only); Phase B inserts them SERIALLY
+        // in the identical frontier/child order, so the DAG is bit-identical to the serial build.
+        // On wasm par_edge is always None and rayon is not linked, so the branch is cfg'd out.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(pe) = par_edge {
+            let all: Vec<Vec<(u64, Piece, u8)>> = frontier
+                .par_iter()
+                .map(|&id| {
                     let key = dag.nodes[id].key;
-                    node_child_triples(key, &visible, two_line_field, &serial_fetch, &mut kids, &mut hold_kids, &mut triples);
-                    let mut edges = Vec::with_capacity(triples.len());
-                    for &(nf, nh, nm) in &triples {
-                        edges.push(get_or_add_node(&mut dag, NodeKey { depth: child_depth, field: nf, hold: nh, mask: nm }));
-                    }
-                    dag.nodes[id].edges = edges;
+                    let mut k = Vec::new();
+                    let mut h = Vec::new();
+                    let mut o = Vec::new();
+                    node_child_triples(key, &visible, two_line_field, &|f, p, b| pe(f, p, b), &mut k, &mut h, &mut o);
+                    o
+                })
+                .collect();
+            for (&id, tr) in frontier.iter().zip(all.iter()) {
+                let mut edges = Vec::with_capacity(tr.len());
+                for &(nf, nh, nm) in tr {
+                    edges.push(get_or_add_node(&mut dag, NodeKey { depth: child_depth, field: nf, hold: nh, mask: nm }));
                 }
+                dag.nodes[id].edges = edges;
+            }
+            continue;
+        }
+        // Serial build (the only path on wasm).
+        {
+            for id in frontier {
+                let key = dag.nodes[id].key;
+                node_child_triples(key, &visible, two_line_field, &serial_fetch, &mut kids, &mut hold_kids, &mut triples);
+                let mut edges = Vec::with_capacity(triples.len());
+                for &(nf, nh, nm) in &triples {
+                    edges.push(get_or_add_node(&mut dag, NodeKey { depth: child_depth, field: nf, hold: nh, mask: nm }));
+                }
+                dag.nodes[id].edges = edges;
             }
         }
     }
@@ -860,16 +877,9 @@ fn prune_to_terminal_reachable(dag: &Dag, two_line_field: u64, par: bool) -> Dag
                 n.edges.iter().any(|&c| marked[c])
             }
         };
-        if par {
-            let res: Vec<bool> = layer.par_iter().map(|&id| mark_of(id, &marked)).collect();
-            for (&id, m) in layer.iter().zip(res) {
-                marked[id] = m;
-            }
-        } else {
-            for &id in layer {
-                let m = mark_of(id, &marked);
-                marked[id] = m;
-            }
+        let res: Vec<bool> = par_or_serial!(par, layer, map, |&id| mark_of(id, &marked));
+        for (&id, m) in layer.iter().zip(res) {
+            marked[id] = m;
         }
     }
 
@@ -900,11 +910,7 @@ fn prune_to_terminal_reachable(dag: &Dag, two_line_field: u64, par: bool) -> Dag
             .map(|&c| old_to_new[c])
             .collect()
     };
-    let new_edges: Vec<Vec<NodeId>> = if par {
-        survivors.par_iter().map(remap).collect()
-    } else {
-        survivors.iter().map(remap).collect()
-    };
+    let new_edges: Vec<Vec<NodeId>> = par_or_serial!(par, survivors, map, remap);
     for (new_id, edges) in new_edges.into_iter().enumerate() {
         nodes[new_id].edges = edges;
     }

@@ -15,6 +15,8 @@ const ORIENT = ["north", "east", "south", "west"];
 
 let wasm = null; // { exports, memory }
 let started = false;
+let badPiece = null; // unsupported piece letter seen in the stream (silently dropping one would
+                     // desync the engine's bag model — forfeit with the reason instead)
 const preInitQueue = []; // messages arriving before WASM is ready
 
 function u8(ptr, len) {
@@ -58,8 +60,12 @@ function handle(m) {
             break;
         case "start": {
             started = true;
+            badPiece = null;
             const hold = m.hold ? PIECES.indexOf(m.hold) : -1;
-            const q = (m.queue || []).map(c => PIECES.indexOf(c)).filter(i => i >= 0);
+            const raw = (m.queue || []).map(c => PIECES.indexOf(c));
+            const badIdx = raw.findIndex(i => i < 0);
+            if (badIdx >= 0) badPiece = (m.queue || [])[badIdx];
+            const q = raw.filter(i => i >= 0);
             const qp = wasm.exports.alloc_bytes(Math.max(1, q.length)) >>> 0;
             u8(qp, Math.max(1, q.length)).set(q);
             // board: 40 rows x 10 cells, row 0 = bottom; occupied = anything non-null
@@ -79,6 +85,11 @@ function handle(m) {
             wasm.exports.tbp_stop();
             break;
         case "suggest": {
+            if (badPiece !== null) {
+                console.warn("[zxcl] no move: unsupported piece '" + badPiece + "' in the stream (7-bag IJLOSTZ only)");
+                self.postMessage({ type: "suggestion", moves: [] });
+                break;
+            }
             const op = wasm.exports.alloc_bytes(16) >>> 0;
             const rc = wasm.exports.tbp_suggest(op);
             if (rc !== 1) {
@@ -107,6 +118,10 @@ function handle(m) {
         case "new_piece": {
             const p = PIECES.indexOf(m.piece);
             if (p >= 0) wasm.exports.tbp_new_piece(p);
+            else if (badPiece === null) {
+                badPiece = m.piece;
+                console.warn("[zxcl] unsupported new_piece '" + m.piece + "' — will forfeit (silently dropping it would desync the bag stream)");
+            }
             break;
         }
         case "quit":

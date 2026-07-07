@@ -13,7 +13,7 @@ use std::cell::RefCell;
 
 use crate::graph::{MAX_HASH, TWO_LINE_HASH};
 use crate::movegen::{self, MoveGen};
-use crate::piece::{after_reveal, Piece, FULL_BAG};
+use crate::piece::{after_reveal, piece_char, Piece, FULL_BAG};
 use crate::proj::ProjFilter;
 use crate::tbpcoord;
 use crate::value_search::{value_search, SearchInput, VsResult};
@@ -201,16 +201,47 @@ impl Bot {
             }
         }
 
-        // Reveals consumed inside this loop: h1.. = stream[boundary_dealt..]; pad the unknown
-        // tail with a valid bag continuation (never read by decision-time scoring).
-        let ls = self.loop_state.as_ref().unwrap();
-        let bd = ls.boundary_dealt;
-        let known = self.stream.len().saturating_sub(bd).min(4);
+        // Reveals the bot may legitimately use: EXACTLY one per placement already made in this
+        // loop (the see-7 boundary). The host often deals the stream further ahead (jstris keeps
+        // 6 previews topped up, which runs one piece past the boundary window) — those pieces are
+        // information the bot must not act on. Slots beyond the placement count stay UNKNOWN:
+        // they get a valid-bag pad here, and the search scores decisions by AVERAGING over them
+        // (fold tables in-loop, w4/w2 at the next boundary), exactly like the offline model.
+        // analyze() reads only hidden[..min(depth,4)], so a pad is never taken for a real reveal.
+        let (bd, path_len) = {
+            let ls = self.loop_state.as_ref().unwrap();
+            (ls.boundary_dealt, ls.path.len())
+        };
+        let known = path_len.min(4);
+        if self.stream.len().saturating_sub(bd) < known {
+            self.out_of_book = true;
+            self.last_error = format!(
+                "reveal underrun: {} placements into the loop but only {} reveals delivered",
+                path_len,
+                self.stream.len().saturating_sub(bd)
+            );
+            return None;
+        }
         let mut hidden = [0u8; 4];
         let mut m = self.loop_mask(bd);
         for i in 0..4 {
             let h = if i < known {
-                self.stream[bd + i]
+                let h = self.stream[bd + i];
+                if m & (1 << h) == 0 {
+                    // A real reveal the bag model says is impossible: the randomizer is not
+                    // 7-bag, or the stream/count desynced. Report precisely — mis-keying the
+                    // value tables here is what used to surface later as a bogus "dead position".
+                    self.out_of_book = true;
+                    self.last_error = format!(
+                        "bag desync: reveal h{}={} not in remaining bag {:07b} (boundary_dealt={})",
+                        i + 1,
+                        piece_char(h),
+                        m,
+                        bd
+                    );
+                    return None;
+                }
+                h
             } else {
                 (0..7u8).find(|&p| m & (1 << p) != 0).unwrap()
             };
@@ -218,14 +249,29 @@ impl Bot {
             m = after_reveal(m, h);
         }
 
+        let ls = self.loop_state.as_ref().unwrap();
         let node = ls.vs.analyze(&ls.path, hidden);
+        if node.field != self.board_hash {
+            self.out_of_book = true;
+            self.last_error = format!(
+                "internal desync: engine field {:#012x} != tracked board {:#012x}",
+                node.field, self.board_hash
+            );
+            return None;
+        }
         if node.terminal != 0 || node.cands.is_empty() || node.best_score <= 0.0 {
             self.out_of_book = true;
-            self.last_error = format!("dead position (terminal={} cands={})", node.terminal, node.cands.len());
+            let revealed: String = (0..known).map(|i| piece_char(self.stream[bd + i])).collect();
+            self.last_error = format!(
+                "dead reveal: no PC continuation after [{}] at depth {} (terminal={} cands={})",
+                revealed,
+                path_len,
+                node.terminal,
+                node.cands.len()
+            );
             return None;
         }
         let best = &node.cands[0];
-        debug_assert_eq!(node.field, self.board_hash);
 
         // Engine transition -> physical placement. Any reachable state producing this child field
         // works; the libtetris-exact encoder canonicalizes S/Z/I/O so the orientation matches
@@ -279,9 +325,35 @@ fn full_bottom_rows(h: u64) -> u32 {
         FULL_BAG & !used
     }
 
+    /// Every complete 7-aligned window of the deal stream must be a full-bag permutation — the
+    /// whole bag model (loop_mask phases, reveal averaging, V* itself) rests on that alignment.
+    /// Returns a description of the first violating window, if any.
+    fn bag_window_violation(&self) -> Option<String> {
+        for k in 0..self.stream.len() / 7 {
+            let w = &self.stream[k * 7..k * 7 + 7];
+            let mut m = 0u8;
+            for &p in w {
+                m |= 1 << p;
+            }
+            if m != FULL_BAG {
+                let s: String = w.iter().map(|&p| piece_char(p)).collect();
+                return Some(format!(
+                    "stream window {} [{}] is not a 7-bag permutation (randomizer not 7-bag, or stream desync)",
+                    k, s
+                ));
+            }
+        }
+        None
+    }
+
     /// Build the boundary (engine hold + 6 visible + bag mask) from tracked state and run the
     /// search. Engine hold = physical hold, or the active piece when hold is empty.
     fn form_boundary(&mut self) -> bool {
+        if let Some(msg) = self.bag_window_violation() {
+            self.last_error = msg;
+            self.out_of_book = true;
+            return false;
+        }
         let (eh, vis_src): (Piece, &[Piece]) = match self.hold {
             Some(h) => (h, &self.queue[..]),
             None => {

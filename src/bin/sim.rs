@@ -5,6 +5,11 @@
 //!   - the cells must be reachable placements on the current physical board,
 //!   - line clears are applied physically and compared against the bot's internal board hash.
 //! usage: sim --proj F --values F [--pcs N] [--seed S] [--previews K (queue len incl active)]
+//!            [--rounds R (jstris-style round restarts: fresh start message, same Bot/worker)]
+//!            [--corrupt-deal K (flip the K-th dealt piece, 0-based per round: simulates a
+//!             non-7-bag randomizer / stream desync — the bot must give up with a precise
+//!             bag-desync/window diagnostic, never emit a physically wrong move)]
+//!            [--expect-giveup (success = a clean give-up; failure = bot plays through)]
 
 use pcbot_wasm::bot::{Bot, ORIENT_NAMES};
 use pcbot_wasm::movegen;
@@ -89,6 +94,20 @@ fn main() {
     let pcs_target: usize = get("--pcs").and_then(|s| s.parse().ok()).unwrap_or(10);
     let seed: u64 = get("--seed").and_then(|s| s.parse().ok()).unwrap_or(1);
     let previews: usize = get("--previews").and_then(|s| s.parse().ok()).unwrap_or(7);
+    let rounds: usize = get("--rounds").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let corrupt_deal: Option<usize> = get("--corrupt-deal").and_then(|s| s.parse().ok());
+    let expect_giveup = args.iter().any(|a| a == "--expect-giveup");
+
+    // Deal the next piece to BOTH host and bot; --corrupt-deal flips one deal (as a broken
+    // randomizer would), which the bot must detect and report — not silently misplay.
+    fn deal(bag: &mut Bag, idx: &mut usize, corrupt: Option<usize>) -> u8 {
+        let mut p = bag.next();
+        if corrupt == Some(*idx) {
+            p = (p + 1) % 7;
+        }
+        *idx += 1;
+        p
+    }
 
     let mut proj = ProjFilter::load(&proj_path).expect("load proj");
     // --projext F: attach the supplementary PCPRJX1 projection(s) the shipped bot embeds, so the
@@ -100,8 +119,14 @@ fn main() {
     let table = ValueTable::load(std::path::Path::new(&values_path)).expect("load values");
     let mut bot = Bot::new(proj, table);
 
-    let mut bag = Bag { rng: seed.max(1), left: Vec::new() };
-    let mut host_queue: Vec<u8> = (0..previews).map(|_| bag.next()).collect();
+    let mut total_pcs = 0usize;
+    let mut t_total = 0f64;
+    'rounds: for round in 0..rounds {
+    // Fresh round, same Bot instance (jstris keeps the worker across rounds and sends a fresh
+    // `start` with a new randomizer): fresh-game detection must reset the bot's stream tracking.
+    let mut bag = Bag { rng: seed.max(1).wrapping_add(round as u64 * 7919), left: Vec::new() };
+    let mut deal_idx = 0usize;
+    let mut host_queue: Vec<u8> = (0..previews).map(|_| deal(&mut bag, &mut deal_idx, corrupt_deal)).collect();
     let mut host_hold: Option<u8> = None;
     let mut phys = Phys { cells: 0 };
 
@@ -110,15 +135,27 @@ fn main() {
 
     let mut pcs_done = 0usize;
     let mut placements = 0usize;
-    let mut t_total = 0f64;
     let mut t_boundary_max = 0f64;
     while pcs_done < pcs_target {
         // suggest
         let t0 = std::time::Instant::now();
         let Some(mv) = bot.suggest() else {
+            if expect_giveup {
+                println!(
+                    "GIVE-UP (expected) round {} after {} placements, {} PCs: {}",
+                    round, placements, pcs_done, bot.last_error
+                );
+                assert!(
+                    bot.last_error.contains("bag desync")
+                        || bot.last_error.contains("7-bag permutation"),
+                    "give-up reason should be a precise bag diagnostic, got: {}",
+                    bot.last_error
+                );
+                return;
+            }
             panic!(
-                "bot returned no move after {} placements, {} PCs: {}",
-                placements, pcs_done, bot.last_error
+                "bot returned no move after {} placements, {} PCs (round {}): {}",
+                placements, pcs_done, round, bot.last_error
             );
         };
         let dt = t0.elapsed().as_secs_f64();
@@ -174,7 +211,7 @@ fn main() {
         let consumed = if mv.piece == active { 1 } else if host_hold == Some(active) { 1 } else { 2 };
         let _ = consumed; // new_piece count actually equals pieces removed from host_queue this turn
         while host_queue.len() < previews {
-            let p = bag.next();
+            let p = deal(&mut bag, &mut deal_idx, corrupt_deal);
             host_queue.push(p);
             bot.new_piece(p);
         }
@@ -182,23 +219,37 @@ fn main() {
         placements += 1;
         if phys.cells == 0 {
             pcs_done += 1;
+            total_pcs += 1;
             if cleared > 0 {
                 // fine: 4LPC finishes with a clear; 2LPC likewise
             }
             println!(
-                "PC {:3} done at placement {:4}  (max suggest {:6.2}s)",
-                pcs_done, placements, t_boundary_max
+                "PC {:3} done at placement {:4}  (round {}, max suggest {:6.2}s)",
+                pcs_done, placements, round, t_boundary_max
             );
             t_boundary_max = 0.0;
+            if expect_giveup && corrupt_deal.map_or(false, |k| deal_idx > k + previews + 8) {
+                // The corrupted deal is well past every window/reveal it can appear in and the
+                // bot is still playing: the diagnostics failed to fire.
+                break 'rounds;
+            }
         }
         assert!(placements < pcs_target * 12 + 50, "too many placements without completing PCs");
     }
     println!(
-        "\nOK: {} PCs in {} placements | suggest total {:.1}s avg/PC {:.2}s",
-        pcs_done,
-        placements,
+        "round {} OK: {} PCs in {} placements",
+        round, pcs_done, placements
+    );
+    }
+    if expect_giveup {
+        panic!("expected a bag-desync give-up, but the bot played {} PCs cleanly", total_pcs);
+    }
+    println!(
+        "\nOK: {} PCs across {} rounds | suggest total {:.1}s avg/PC {:.2}s",
+        total_pcs,
+        rounds,
         t_total,
-        t_total / pcs_done as f64
+        t_total / total_pcs.max(1) as f64
     );
 }
 
