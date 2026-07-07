@@ -119,6 +119,16 @@ fn main() {
     let table = ValueTable::load(std::path::Path::new(&values_path)).expect("load values");
     let mut bot = Bot::new(proj, table);
 
+    // --reveal-lag N: model jstris' LAZY reveal delivery. Newly drawn pieces still fill the host's
+    // physical queue immediately (so the bot never starves), but the corresponding `new_piece`
+    // messages to the bot are held back N placements — reproducing the live case where the bot is
+    // asked to suggest the next move before the reveal for the current one has arrived (depth < 6
+    // needs no reveal, so a correct bot must still move). Pending reveals are flushed at each PC
+    // boundary (the jstris bot.js patch tops the preview queue up to 6 there). N=0 is the default
+    // eager delivery.
+    let reveal_lag: usize = get("--reveal-lag").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let start_hold = args.iter().any(|a| a == "--start-hold");
+
     let mut total_pcs = 0usize;
     let mut t_total = 0f64;
     'rounds: for round in 0..rounds {
@@ -126,12 +136,17 @@ fn main() {
     // `start` with a new randomizer): fresh-game detection must reset the bot's stream tracking.
     let mut bag = Bag { rng: seed.max(1).wrapping_add(round as u64 * 7919), left: Vec::new() };
     let mut deal_idx = 0usize;
+    // --start-hold: begin each round with a piece already in hold, exactly like the live jstris
+    // trace (start hold=S queue=TOLZIJ). hold + `previews` queue must span a clean bag prefix, so
+    // deal the hold first from the same bag stream.
+    let mut host_hold: Option<u8> = if start_hold { Some(deal(&mut bag, &mut deal_idx, corrupt_deal)) } else { None };
     let mut host_queue: Vec<u8> = (0..previews).map(|_| deal(&mut bag, &mut deal_idx, corrupt_deal)).collect();
-    let mut host_hold: Option<u8> = None;
     let mut phys = Phys { cells: 0 };
+    // Reveals drawn into the physical queue but not yet delivered to the bot (held back reveal_lag).
+    let mut pending_reveals: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
 
     // start
-    bot.start(None, &host_queue, &phys.board_cells(), 0);
+    bot.start(host_hold, &host_queue, &phys.board_cells(), 0);
 
     let mut pcs_done = 0usize;
     let mut placements = 0usize;
@@ -210,14 +225,23 @@ fn main() {
         bot.play();
         let consumed = if mv.piece == active { 1 } else if host_hold == Some(active) { 1 } else { 2 };
         let _ = consumed; // new_piece count actually equals pieces removed from host_queue this turn
+        // Physical queue refills immediately; the bot's new_piece delivery is held back reveal_lag.
         while host_queue.len() < previews {
             let p = deal(&mut bag, &mut deal_idx, corrupt_deal);
             host_queue.push(p);
-            bot.new_piece(p);
+            pending_reveals.push_back(p);
+        }
+        while pending_reveals.len() > reveal_lag {
+            bot.new_piece(pending_reveals.pop_front().unwrap());
         }
 
         placements += 1;
         if phys.cells == 0 {
+            // PC boundary: flush all held-back reveals (jstris' bot.js patch tops the preview
+            // queue up to 6 at a boundary, so the bot forms the next boundary with full previews).
+            for p in pending_reveals.drain(..) {
+                bot.new_piece(p);
+            }
             pcs_done += 1;
             total_pcs += 1;
             if cleared > 0 {
