@@ -50,7 +50,9 @@ function lastError() {
     const cap = 256;
     const p = wasm.exports.alloc_bytes(cap) >>> 0;
     const n = wasm.exports.tbp_last_error(p, cap);
-    return new TextDecoder().decode(u8(p, n));
+    const s = new TextDecoder().decode(u8(p, n));
+    wasm.exports.free_bytes(p, cap);
+    return s;
 }
 
 function handle(m) {
@@ -66,18 +68,25 @@ function handle(m) {
             const badIdx = raw.findIndex(i => i < 0);
             if (badIdx >= 0) badPiece = (m.queue || [])[badIdx];
             const q = raw.filter(i => i >= 0);
-            const qp = wasm.exports.alloc_bytes(Math.max(1, q.length)) >>> 0;
-            u8(qp, Math.max(1, q.length)).set(q);
+            const qlen = Math.max(1, q.length);
+            const qp = wasm.exports.alloc_bytes(qlen) >>> 0;
+            u8(qp, qlen).set(q);
             // board: 40 rows x 10 cells, row 0 = bottom; occupied = anything non-null
             const bp = wasm.exports.alloc_bytes(400) >>> 0;
             const bv = u8(bp, 400);
             bv.fill(0);
             const rows = m.board || [];
+            let filled = 0;
             for (let r = 0; r < Math.min(40, rows.length); r++) {
                 const row = rows[r] || [];
-                for (let c = 0; c < 10; c++) if (row[c]) bv[r * 10 + c] = 1;
+                for (let c = 0; c < 10; c++) if (row[c]) { bv[r * 10 + c] = 1; filled++; }
             }
+            // A PC bot can only start from an empty board; log when the host hands it a filled one
+            // (garbage / mid-game board update) so a "non-empty board" forfeit can be traced.
+            if (filled) console.warn(`[zxcl] start with NON-EMPTY board (${filled} cells) hold=${m.hold || "-"} queue=${(m.queue || []).join("")}`);
             wasm.exports.tbp_start(hold, qp, q.length, bp, m.combo | 0);
+            wasm.exports.free_bytes(qp, qlen);
+            wasm.exports.free_bytes(bp, 400);
             break;
         }
         case "stop":
@@ -93,19 +102,22 @@ function handle(m) {
             const op = wasm.exports.alloc_bytes(16) >>> 0;
             const rc = wasm.exports.tbp_suggest(op);
             if (rc !== 1) {
+                wasm.exports.free_bytes(op, 16);
                 console.warn("[zxcl] no move (" + rc + "): " + lastError());
                 self.postMessage({ type: "suggestion", moves: [] });
                 break;
             }
             const o = new Int32Array(wasm.memory.buffer, op, 4);
+            const [pc, or, mx, my] = [o[0], o[1], o[2], o[3]];
+            wasm.exports.free_bytes(op, 16);
             self.postMessage({
                 type: "suggestion",
                 moves: [{
                     location: {
-                        type: PIECES[o[0]],
-                        orientation: ORIENT[o[1]],
-                        x: o[2],
-                        y: o[3],
+                        type: PIECES[pc],
+                        orientation: ORIENT[or],
+                        x: mx,
+                        y: my,
                     },
                     spin: "none",
                 }],

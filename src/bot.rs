@@ -230,7 +230,20 @@ impl Bot {
         if self.loop_state.is_none() {
             if self.board_hash != 0 {
                 self.out_of_book = true;
-                self.last_error = "non-empty board without an active loop (resync mid-loop?)".into();
+                // Board rows 0..3 (bottom-up), '#'=filled '.'=empty, so a garbage board (host sent a
+                // start/board-update the PC bot can't play) is distinguishable from a stray residual.
+                let mut rows = String::new();
+                for r in 0..4 {
+                    if r > 0 { rows.push('/'); }
+                    for c in 0..10 {
+                        rows.push(if self.board_hash >> (r * 10 + (9 - c)) & 1 != 0 { '#' } else { '.' });
+                    }
+                }
+                self.last_error = format!(
+                    "non-empty board without an active loop (host sent a non-empty board, or a PC \
+                     completion desynced): board[r0..r3]={} placed={}",
+                    rows, self.placed_cnt
+                );
                 return None;
             }
             if !self.form_boundary() {

@@ -62,16 +62,77 @@ const FULL_MASK: u8 = 0b111_1111;
 const TERMINAL_HASH: u64 = MAX_HASH;
 const ROOT_HASH: u64 = 0;
 
-type NodeId = usize;
-/// Element type of the big per-node value vectors. Native keeps f64 (research-exact root
-/// values); wasm uses f32 to halve the dominant memory (folds/outputs stay f64 either way).
-#[cfg(not(target_arch = "wasm32"))]
-type Val = f64;
-#[cfg(target_arch = "wasm32")]
-type Val = f32;
-type ValVec = Vec<Val>;
-type ValTable = HashMap<NodeId, ValVec>;
+/// Node ids stay well under 2^32 (a few million per boundary), so u32 halves every id-carrying
+/// structure: CSR edges, the build index, fold keys, and the shallow reverse index.
+type NodeId = u32;
+
+/// Per-node value vectors (depths 4..10) dominate memory — they hold one value per hidden-reveal
+/// leaf (up to 840) for hundreds of thousands of live nodes. Storing them as u16 instead of f32
+/// halves that (the single biggest wasm-memory consumer). Values are "expected consecutive PCs",
+/// bounded by 1 + max boundary V*; QUANT_MAX gives comfortable headroom so nothing clips.
+///
+/// The backup is elementwise MAX, and quantization q(v)=round(v/QUANT_MAX*65535) is monotone, so
+/// max(q(a),q(b)) == q(max(a,b)) — the whole backup runs in u16 with NO error beyond quantizing the
+/// terminal seeds (~QUANT_MAX/65535 ≈ 0.067). The fold averages (depths 0..3) dequantize to f64, so
+/// only they carry that one-step error — same regime as the offline V* table (12-bit: move-exact).
+type Quant = u16;
+const QUANT_MAX: f64 = 4400.0; // > 1 + max V* (~4356); no live value reaches it, so no clipping
+const QZERO: Quant = 0; // quant(0.0); a dead leaf
+
+#[inline]
+fn quant(v: f64) -> Quant {
+    let x = (v / QUANT_MAX * 65535.0).round();
+    if x <= 0.0 {
+        0
+    } else if x >= 65535.0 {
+        65535
+    } else {
+        x as Quant
+    }
+}
+
+#[inline]
+fn dequant(q: Quant) -> f64 {
+    q as f64 * (QUANT_MAX / 65535.0)
+}
+
 type FoldTable = HashMap<u16, HashMap<NodeId, f64>>;
+
+/// One depth's value vectors as a single arena: all vectors concatenated in layer order, with a
+/// per-layer-slot (offset, len) index. Node ids are assigned layer-contiguously (build discovers
+/// depth by depth and prune preserves id order), so `id - start` is the slot directly — lookups
+/// are two array reads instead of a hash probe, and the per-node Vec headers, allocator overhead
+/// and hash-table slack (~70MB per boundary) disappear.
+#[derive(Default)]
+struct ValLayer {
+    start: NodeId,  // first node id of this depth's layer
+    off: Vec<u32>,  // per slot: offset into data; u32::MAX = no value (dead node)
+    len: Vec<u32>,  // per slot: vector length (undefined when off == MAX)
+    data: Vec<Quant>,
+}
+
+impl ValLayer {
+    #[inline]
+    fn get(&self, id: NodeId) -> Option<&[Quant]> {
+        let slot = id.checked_sub(self.start)? as usize;
+        let o = *self.off.get(slot)?;
+        if o == u32::MAX {
+            return None;
+        }
+        Some(&self.data[o as usize..o as usize + self.len[slot] as usize])
+    }
+
+    #[inline]
+    fn contains(&self, id: NodeId) -> bool {
+        id.checked_sub(self.start)
+            .and_then(|slot| self.off.get(slot as usize))
+            .map_or(false, |&o| o != u32::MAX)
+    }
+
+    fn live(&self) -> usize {
+        self.off.iter().filter(|&&o| o != u32::MAX).count()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct NodeKey {
@@ -86,20 +147,48 @@ struct NodeKey {
     mask: u8,
 }
 
-#[derive(Clone, Debug)]
-struct Node {
-    key: NodeKey,
-    edges: Vec<NodeId>,
-}
-
-#[derive(Clone, Debug)]
+/// CSR node storage: keys plus one flat edge array. Nodes are created in id order and their edge
+/// lists are also FILLED in id order (the build walks each layer's frontier ascending, and every
+/// child id it creates is larger), so edges append contiguously — node id's edges live at
+/// edge_data[edge_start[id]..edge_start[id+1]]. Replaces a Vec<NodeId> per node (24B header +
+/// allocator overhead x millions of nodes).
+#[derive(Clone, Debug, Default)]
 struct Dag {
-    nodes: Vec<Node>,
+    keys: Vec<NodeKey>,
+    edge_start: Vec<u32>, // len keys.len()+1 once sealed
+    edge_data: Vec<NodeId>,
     layers: Vec<Vec<NodeId>>, // 0..10
     // Keyed by pack_key(NodeKey): field(40b) | depth(4b) | hold(3b) | mask(7b) = 54 bits.
     // A single-word key hashes much faster than the 12-byte struct (~10^8 lookups per boundary).
     index: HashMap<u64, NodeId>,
     root: NodeId,
+}
+
+impl Dag {
+    #[inline]
+    fn key(&self, id: NodeId) -> &NodeKey {
+        &self.keys[id as usize]
+    }
+
+    #[inline]
+    fn edges(&self, id: NodeId) -> &[NodeId] {
+        &self.edge_data[self.edge_start[id as usize] as usize..self.edge_start[id as usize + 1] as usize]
+    }
+
+    /// Begin node `id`'s edge list (must be called in ascending id order; children then append
+    /// via push_edge). Terminal-layer nodes are covered by seal().
+    #[inline]
+    fn begin_edges(&mut self, id: NodeId) {
+        debug_assert!(self.edge_start.len() == id as usize);
+        self.edge_start.push(self.edge_data.len() as u32);
+    }
+
+    /// Pad edge_start so every node (incl. never-processed terminal-layer ones) has a range.
+    fn seal(&mut self) {
+        while self.edge_start.len() <= self.keys.len() {
+            self.edge_start.push(self.edge_data.len() as u32);
+        }
+    }
 }
 
 #[inline]
@@ -154,7 +243,7 @@ pub struct VsResult {
 struct Retained {
     dag: Dag,
     ranges: HashMap<(u8, u16), SeqRange>, // (prefix_len 0..=4, pack) -> leaf range
-    vals: Vec<ValTable>,                  // depth 4..=10 at index depth
+    vals: Vec<ValLayer>,                  // depth 4..=10 at index depth
     folds: Vec<FoldTable>,                // index 1..=3: value_d keyed by len-d prefix pack
     initial_mask: u8,
     visible: [Piece; 6],
@@ -206,17 +295,24 @@ pub fn value_search(mut input: SearchInput<'_>) -> VsResult {
         // Scope the UNPRUNED dag so it's freed right after pruning (shadowing alone would keep
         // both DAGs alive through the whole solve), and drop its build-only node index first.
         let mut full = build_dag(input.graph, input.edge_ids, input.par_edge, input.hold, input.visible, initial_mask, two_line_field);
-        let nodes_total = full.nodes.len();
+        let nodes_total = full.keys.len();
         let t_build = _t.elapsed();
         full.index = HashMap::new();
         (prune_to_terminal_reachable(&full, two_line_field, input.par_edge.is_some()), nodes_total, t_build)
     };
-    let nodes_pruned = dag.nodes.len();
+    let nodes_pruned = dag.keys.len();
     let t_prune = _t.elapsed() - t_build;
     if verbose { eprintln!(
         "value-search: nodes {} -> {} (terminal-reachable), hidden_leaves={} | build {:.2}ms prune {:.2}ms",
         nodes_total, nodes_pruned, leaf_count, t_build.as_secs_f64() * 1e3, t_prune.as_secs_f64() * 1e3
-    ); }
+    );
+        let per_layer: Vec<usize> = dag.layers.iter().map(|l| l.len()).collect();
+        eprintln!(
+            "value-search: edges_total={} ({}MB u32) node_keys={}MB layers={:?}",
+            dag.edge_data.len(), dag.edge_data.len() * 4 / 1_000_000,
+            dag.keys.len() * std::mem::size_of::<NodeKey>() / 1_000_000, per_layer
+        );
+    }
     let _t = Instant::now();
     // Parallel solve rides the same switch as the parallel build.
     let par = input.par_edge.is_some();
@@ -230,74 +326,129 @@ pub fn value_search(mut input: SearchInput<'_>) -> VsResult {
     };
 
     // ---- seed depth 10 (4LPC terminals) ----
-    let mut vals: Vec<ValTable> = vec![ValTable::new(); 11];
+    let mut vals: Vec<ValLayer> = Vec::with_capacity(11);
+    for _ in 0..11 {
+        vals.push(ValLayer::default());
+    }
     {
-        let table = &mut vals[10];
-        for &id in &dag.layers[10] {
-            let key = dag.nodes[id].key;
+        let layer = &dag.layers[10];
+        let mut l = ValLayer {
+            start: layer.first().copied().unwrap_or(0),
+            off: vec![u32::MAX; layer.len()],
+            len: vec![0u32; layer.len()],
+            data: Vec::new(),
+        };
+        for (slot, &id) in layer.iter().enumerate() {
+            let key = dag.key(id);
             if key.field != TERMINAL_HASH {
                 continue;
             }
             // key.mask at depth 10 IS the bag after all four reveals (mask4).
             let v = input.reset.w4(key.hold, key.mask);
             if v > 0.0 {
-                table.insert(id, vec![v as Val]); // suffix-len 0 -> vector of 1
+                l.off[slot] = l.data.len() as u32;
+                l.len[slot] = 1;
+                l.data.push(quant(v)); // suffix-len 0 -> vector of 1
             }
         }
-        if verbose { eprintln!("value-search: depth10 live={}", table.len()); }
+        if verbose { eprintln!("value-search: depth10 live={}", l.live()); }
+        vals[10] = l;
     }
 
     // ---- elementwise-max backup depths 9..4, with 2LPC injection at depth 5 ----
-    // FORWARD-edge, per-parent: each parent folds its own children's vectors into a private
-    // vector, so the depth is embarrassingly parallel (no reverse index, no write contention).
-    // f64 max is exact (no rounding), so serial/parallel/any-order produce IDENTICAL values.
+    // FORWARD-edge, per-parent, in TWO passes over the layer: pass 1 (cheap) marks live parents
+    // (any live child; at depth 5 also the childless 2LPC terminals) and lays out one arena;
+    // pass 2 max-folds every parent directly into its disjoint arena slice. No per-parent Vec is
+    // ever allocated, so the old transient (a Vec per node before table insert) is gone.
+    // u16 max is exact and order-independent (quant is monotone), so serial/parallel/any-order
+    // produce IDENTICAL values.
     for depth in (4..10u8).rev() {
         let prev = &vals[(depth + 1) as usize];
-        let compute = |&parent_id: &NodeId| -> Option<(NodeId, ValVec)> {
-            let parent_key = dag.nodes[parent_id].key;
-            let mut dst: ValVec = Vec::new();
-            for &child_id in &dag.nodes[parent_id].edges {
-                let Some(child_vec) = prev.get(&child_id) else { continue };
+        let layer = &dag.layers[depth as usize];
+
+        // Pass 1: liveness. A parent is live iff any child carries a vector; depth-5 two-line
+        // terminals are live unconditionally (they get their reset value injected below).
+        let live_of = |&id: &NodeId| -> bool {
+            (depth == 5 && dag.key(id).field == two_line_field)
+                || dag.edges(id).iter().any(|&c| prev.contains(c))
+        };
+        let alive: Vec<bool> = par_or_serial!(par, layer, map, live_of);
+
+        let mut next = ValLayer {
+            start: layer.first().copied().unwrap_or(0),
+            off: vec![u32::MAX; layer.len()],
+            len: vec![0u32; layer.len()],
+            data: Vec::new(),
+        };
+        let mut total = 0usize;
+        for (slot, (&id, &a)) in layer.iter().zip(&alive).enumerate() {
+            if a {
+                let l = vec_len(dag.key(id)) as u32;
+                next.off[slot] = total as u32;
+                next.len[slot] = l;
+                total += l as usize;
+            }
+        }
+        next.data = vec![QZERO; total];
+
+        // Pass 2: carve the arena into per-parent slices (disjoint by construction) and fold.
+        let mut jobs: Vec<(NodeId, &mut [Quant])> = Vec::new();
+        {
+            let mut rest: &mut [Quant] = &mut next.data;
+            for (slot, &id) in layer.iter().enumerate() {
+                if next.off[slot] == u32::MAX {
+                    continue;
+                }
+                let (dst, tail) = std::mem::take(&mut rest).split_at_mut(next.len[slot] as usize);
+                rest = tail;
+                jobs.push((id, dst));
+            }
+        }
+        let fold = |(parent_id, dst): &mut (NodeId, &mut [Quant])| {
+            let parent_key = dag.key(*parent_id);
+            for &child_id in dag.edges(*parent_id) {
+                let Some(child_vec) = prev.get(child_id) else { continue };
                 // Reveal-consuming transitions (child depth >= 7): the child's block sits at the
                 // parent's suffix offset of the revealed piece q. q is unique from the mask diff
                 // (pm\cm = {q}; empty diff means the singleton bag refilled, so q = that piece).
                 let offset = if depth >= 6 {
                     let pm = parent_key.mask;
-                    let d = pm & !dag.nodes[child_id].key.mask;
+                    let d = pm & !dag.key(child_id).mask;
                     let q = if d != 0 { d.trailing_zeros() } else { pm.trailing_zeros() };
                     suffix.off[pm as usize][(10 - depth) as usize][q as usize] as usize
                 } else {
                     0
                 };
-                if dst.is_empty() {
-                    dst = vec![0.0; vec_len(&parent_key)];
-                }
                 // branchless elementwise max over the aligned slice -> auto-vectorizes (AVX).
                 let d = &mut dst[offset..offset + child_vec.len()];
                 for (dd, &cv) in d.iter_mut().zip(child_vec.iter()) {
                     *dd = if cv > *dd { cv } else { *dd };
                 }
             }
-            if dst.is_empty() { None } else { Some((parent_id, dst)) }
         };
-        let layer = &dag.layers[depth as usize];
-        let pairs: Vec<(NodeId, ValVec)> = par_or_serial!(par, layer, filter_map, compute);
-        let mut next: ValTable = ValTable::with_capacity(pairs.len());
-        for (pid, v) in pairs {
-            next.insert(pid, v);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if par {
+                jobs.par_iter_mut().for_each(fold);
+            } else {
+                jobs.iter_mut().for_each(fold);
+            }
         }
+        #[cfg(target_arch = "wasm32")]
+        jobs.iter_mut().for_each(fold);
+        drop(jobs);
+
         if depth == 5 {
             // 2LPC terminals: childless two-line nodes get their reset value directly.
             let q5 = input.visible[5];
             let mut memo: HashMap<(Piece, u16), f64> = HashMap::new();
-            for &id in &dag.layers[5] {
-                let key = dag.nodes[id].key;
+            for (slot, &id) in dag.layers[5].iter().enumerate() {
+                let key = *dag.key(id);
                 if key.field != two_line_field {
                     continue;
                 }
-                let vec = next
-                    .entry(id)
-                    .or_insert_with(|| vec![0.0; leaf_count]);
+                let o = next.off[slot] as usize; // live by construction (pass 1)
+                let vec = &mut next.data[o..o + leaf_count];
                 for leaf in 0..leaf_count {
                     let pack = full_hidden_packs[leaf];
                     let v = *memo.entry((key.hold, pack)).or_insert_with(|| {
@@ -310,17 +461,19 @@ pub fn value_search(mut input: SearchInput<'_>) -> VsResult {
                         let mask4 = mask_after_hidden_prefix(initial_mask, pack, 4);
                         input.reset.w2(key.hold, q5, h, mask4)
                     });
-                    if (v as Val) > vec[leaf] {
-                        vec[leaf] = v as Val;
+                    let vq = quant(v);
+                    if vq > vec[leaf] {
+                        vec[leaf] = vq;
                     }
                 }
             }
         }
-        if verbose { eprintln!(
-            "value-search: depth{} live={}",
-            depth,
-            next.len()
-        ); }
+        if verbose {
+            eprintln!(
+                "value-search: depth{} live={} elems={} u16_MB={:.1}",
+                depth, next.live(), next.data.len(), next.data.len() as f64 * 2.0 / 1e6
+            );
+        }
         vals[depth as usize] = next;
     }
 
@@ -346,13 +499,13 @@ pub fn value_search(mut input: SearchInput<'_>) -> VsResult {
         let vals4 = &vals[4];
         let compute = |&parent_id: &NodeId| -> (NodeId, Vec<(u16, f64)>) {
             let mut per: HashMap<(u16, NodeId), f64> = HashMap::new();
-            for &child_id in &dag.nodes[parent_id].edges {
-                if let Some(child_vec) = vals4.get(&child_id) {
+            for &child_id in dag.edges(parent_id) {
+                if let Some(child_vec) = vals4.get(child_id) {
                     for (i, &cv) in child_vec.iter().enumerate() {
-                        if cv <= 0.0 {
+                        if cv == QZERO {
                             continue;
                         }
-                        *per.entry((pack3_of[i], child_id)).or_insert(0.0) += cv as f64;
+                        *per.entry((pack3_of[i], child_id)).or_insert(0.0) += dequant(cv);
                     }
                 }
             }
@@ -386,11 +539,13 @@ pub fn value_search(mut input: SearchInput<'_>) -> VsResult {
 
     // Mini reverse index for the shallow folds (children at depths 1..=3, parents at 0..=2);
     // within a layer parents are id-ascending, matching the old full reverse index's order.
-    let mut mini_rev: Vec<Vec<NodeId>> = vec![Vec::new(); dag.nodes.len()];
+    // Keyed by child id (only ~10^4 shallow children exist — a dense per-node Vec wasted ~20MB
+    // of empty Vec headers across the whole DAG).
+    let mut mini_rev: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     for d in 0..=2usize {
         for &pid in &dag.layers[d] {
-            for &c in &dag.nodes[pid].edges {
-                mini_rev[c].push(pid);
+            for &c in dag.edges(pid) {
+                mini_rev.entry(c).or_default().push(pid);
             }
         }
     }
@@ -409,13 +564,20 @@ pub fn value_search(mut input: SearchInput<'_>) -> VsResult {
                 if cv <= 0.0 {
                     continue;
                 }
-                for &parent_id in &mini_rev[child_id] {
-                    if dag.nodes[parent_id].key.depth != depth {
+                let Some(parents) = mini_rev.get(&child_id) else { continue };
+                for &parent_id in parents {
+                    if dag.key(parent_id).depth != depth {
                         continue;
                     }
                     *sums.entry((parent_pack, parent_id, child_id)).or_insert(0.0) += cv;
                 }
             }
+        }
+        if verbose {
+            eprintln!(
+                "value-search: fold depth{} sums_entries={} (~{}MB in map)",
+                depth, sums.len(), sums.len() * 28 / 1_000_000
+            );
         }
         let out = fold_from_sums(sums, initial_mask, depth);
         if verbose { eprintln!("value-search: fold depth{} tables={}", depth, out.len()); }
@@ -431,7 +593,13 @@ pub fn value_search(mut input: SearchInput<'_>) -> VsResult {
         .copied()
         .unwrap_or(0.0);
 
-    if verbose { eprintln!("value-search: solve(rev+backup+fold) {:.2}ms", _t.elapsed().as_secs_f64() * 1e3); }
+    if verbose {
+        for d in 0..=3usize {
+            let entries: usize = folds[d].values().map(|t| t.len()).sum();
+            eprintln!("value-search: fold depth{} tables={} entries={}", d, folds[d].len(), entries);
+        }
+        eprintln!("value-search: solve(rev+backup+fold) {:.2}ms", _t.elapsed().as_secs_f64() * 1e3);
+    }
 
     let missing_keys = input.reset.missing_keys;
     VsResult {
@@ -544,11 +712,11 @@ impl VsResult {
                 if n == 0.0 { 0.0 } else { sum / n }
             }
             4..=10 => {
-                let key = r.dag.nodes[child_id].key;
+                let key = *r.dag.key(child_id);
                 if key.depth <= 6 {
                     return r.vals[key.depth as usize]
-                        .get(&child_id)
-                        .map(|v| v[leaf] as f64)
+                        .get(child_id)
+                        .map(|v| dequant(v[leaf]))
                         .unwrap_or(0.0);
                 }
                 // Merged node: its vector is indexed by suffix-rank. Rebuild the reveal prefix
@@ -565,8 +733,8 @@ impl VsResult {
                 }
                 let block = r.ranges[&(plen, pack)];
                 r.vals[key.depth as usize]
-                    .get(&child_id)
-                    .map(|v| v[leaf - block.start as usize] as f64)
+                    .get(child_id)
+                    .map(|v| dequant(v[leaf - block.start as usize]))
                     .unwrap_or(0.0)
             }
             _ => 0.0,
@@ -622,8 +790,8 @@ impl VsResult {
 
         let _ = leaf;
         let make_cand = |edge: usize, parent: NodeId, child: NodeId, child_depth: u8| -> AnalysisCand {
-            let pk = r.dag.nodes[parent].key;
-            let ck = r.dag.nodes[child].key;
+            let pk = *r.dag.key(parent);
+            let ck = *r.dag.key(child);
             let active = active_piece(&r.visible, &hidden, pk.depth);
             let placed = if ck.hold == pk.hold { active } else { pk.hold };
             let score = self.decision_score(child, child_depth, &hidden);
@@ -637,30 +805,29 @@ impl VsResult {
         let mut node = r.dag.root;
         let mut path_steps = Vec::new();
         for &e in path {
-            let edges = r.dag.nodes[node].edges.clone();
+            let edges = r.dag.edges(node);
             if e >= edges.len() {
                 break;
             }
             let child = edges[e];
-            let cd = r.dag.nodes[node].key.depth + 1;
+            let cd = r.dag.key(node).depth + 1;
             path_steps.push(make_cand(e, node, child, cd));
             node = child;
         }
 
-        let key = r.dag.nodes[node].key;
+        let key = *r.dag.key(node);
         let depth = key.depth;
         let active = active_piece(&r.visible, &hidden, depth);
 
-        let edges = r.dag.nodes[node].edges.clone();
         let mut cands = Vec::new();
-        for (ei, &child) in edges.iter().enumerate() {
+        for (ei, &child) in r.dag.edges(node).iter().enumerate() {
             // At reveal depths (>=6) the DAG branches over EVERY piece that COULD be revealed here;
             // once the reveal is known (the passed `hidden`), the other branches are impossible, so
             // prune every edge whose reveal disagrees with the actual hidden. Under transposition
             // merging the reveal is identified by the child's mask (unique per reveal from a node).
             if depth >= 6 {
                 let idx = (depth - 6) as usize;
-                if r.dag.nodes[child].key.mask != after_reveal(key.mask, hidden[idx]) {
+                if r.dag.key(child).mask != after_reveal(key.mask, hidden[idx]) {
                     continue;
                 }
             }
@@ -731,7 +898,9 @@ fn build_dag(
     #[cfg(target_arch = "wasm32")]
     let _ = &par_edge; // parallel build is native-only; keep the signature stable across targets
     let mut dag = Dag {
-        nodes: Vec::new(),
+        keys: Vec::new(),
+        edge_start: Vec::new(),
+        edge_data: Vec::new(),
         layers: vec![Vec::new(); 11],
         index: HashMap::new(),
         root: 0,
@@ -770,7 +939,7 @@ fn build_dag(
             let all: Vec<Vec<(u64, Piece, u8)>> = frontier
                 .par_iter()
                 .map(|&id| {
-                    let key = dag.nodes[id].key;
+                    let key = *dag.key(id);
                     let mut k = Vec::new();
                     let mut h = Vec::new();
                     let mut o = Vec::new();
@@ -779,27 +948,28 @@ fn build_dag(
                 })
                 .collect();
             for (&id, tr) in frontier.iter().zip(all.iter()) {
-                let mut edges = Vec::with_capacity(tr.len());
+                dag.begin_edges(id);
                 for &(nf, nh, nm) in tr {
-                    edges.push(get_or_add_node(&mut dag, NodeKey { depth: child_depth, field: nf, hold: nh, mask: nm }));
+                    let c = get_or_add_node(&mut dag, NodeKey { depth: child_depth, field: nf, hold: nh, mask: nm });
+                    dag.edge_data.push(c);
                 }
-                dag.nodes[id].edges = edges;
             }
             continue;
         }
         // Serial build (the only path on wasm).
         {
             for id in frontier {
-                let key = dag.nodes[id].key;
+                let key = *dag.key(id);
                 node_child_triples(key, &visible, two_line_field, &serial_fetch, &mut kids, &mut hold_kids, &mut triples);
-                let mut edges = Vec::with_capacity(triples.len());
+                dag.begin_edges(id);
                 for &(nf, nh, nm) in &triples {
-                    edges.push(get_or_add_node(&mut dag, NodeKey { depth: child_depth, field: nf, hold: nh, mask: nm }));
+                    let c = get_or_add_node(&mut dag, NodeKey { depth: child_depth, field: nf, hold: nh, mask: nm });
+                    dag.edge_data.push(c);
                 }
-                dag.nodes[id].edges = edges;
             }
         }
     }
+    dag.seal();
     dag
 }
 
@@ -853,8 +1023,8 @@ fn get_or_add_node(dag: &mut Dag, key: NodeKey) -> NodeId {
     if let Some(&id) = dag.index.get(&pk) {
         return id;
     }
-    let id = dag.nodes.len();
-    dag.nodes.push(Node { key, edges: Vec::new() });
+    let id = dag.keys.len() as NodeId;
+    dag.keys.push(key);
     dag.index.insert(pk, id);
     dag.layers[key.depth as usize].push(id);
     id
@@ -864,58 +1034,58 @@ fn prune_to_terminal_reachable(dag: &Dag, two_line_field: u64, par: bool) -> Dag
     // Layered backward sweep (edges go depth -> depth+1, so children are finalized before their
     // parents): a node survives iff it IS a terminal or ANY child survives. Same set as the old
     // reverse-index BFS, but with no reverse index to build, and each layer is parallel-safe.
-    let mut marked = vec![false; dag.nodes.len()];
+    let mut marked = vec![false; dag.keys.len()];
     for depth in (0..=10usize).rev() {
         let layer = &dag.layers[depth];
         let mark_of = |id: NodeId, marked: &[bool]| -> bool {
-            let n = &dag.nodes[id];
+            let key = dag.key(id);
             if depth == 10 {
-                n.key.field == TERMINAL_HASH
-            } else if depth == 5 && n.key.field == two_line_field {
+                key.field == TERMINAL_HASH
+            } else if depth == 5 && key.field == two_line_field {
                 true
             } else {
-                n.edges.iter().any(|&c| marked[c])
+                dag.edges(id).iter().any(|&c| marked[c as usize])
             }
         };
         let res: Vec<bool> = par_or_serial!(par, layer, map, |&id| mark_of(id, &marked));
         for (&id, m) in layer.iter().zip(res) {
-            marked[id] = m;
+            marked[id as usize] = m;
         }
     }
 
-    let mut old_to_new = vec![usize::MAX; dag.nodes.len()];
-    let mut nodes = Vec::new();
+    let mut old_to_new = vec![NodeId::MAX; dag.keys.len()];
+    let mut keys = Vec::new();
     let mut layers = vec![Vec::new(); 11];
-    // NOTE: the pruned DAG's `index` is never read again (get_or_add_node runs only during build),
-    // so we skip rebuilding it — saves ~1.1M hashmap inserts per boundary.
-    let index = HashMap::new();
-    let mut survivors: Vec<NodeId> = Vec::new();
-    for old_id in 0..dag.nodes.len() {
+    for old_id in 0..dag.keys.len() {
         if !marked[old_id] {
             continue;
         }
-        let new_id = nodes.len();
+        let new_id = keys.len() as NodeId;
         old_to_new[old_id] = new_id;
-        let key = dag.nodes[old_id].key;
-        nodes.push(Node { key, edges: Vec::new() });
+        let key = dag.keys[old_id];
+        keys.push(key);
         layers[key.depth as usize].push(new_id);
-        survivors.push(old_id);
     }
-    // Remap edges per surviving node (independent -> parallel-safe); dup-free, original order.
-    let remap = |&old_id: &NodeId| -> Vec<NodeId> {
-        dag.nodes[old_id]
-            .edges
-            .iter()
-            .filter(|&&c| marked[c])
-            .map(|&c| old_to_new[c])
-            .collect()
-    };
-    let new_edges: Vec<Vec<NodeId>> = par_or_serial!(par, survivors, map, remap);
-    for (new_id, edges) in new_edges.into_iter().enumerate() {
-        nodes[new_id].edges = edges;
+    // Remap edges into the new CSR in one ascending pass (old ids ascend -> new ids ascend, so
+    // layer contiguity is preserved); dup-free, original order.
+    let mut edge_start = Vec::with_capacity(keys.len() + 1);
+    let mut edge_data = Vec::new();
+    for old_id in 0..dag.keys.len() {
+        if !marked[old_id] {
+            continue;
+        }
+        edge_start.push(edge_data.len() as u32);
+        for &c in dag.edges(old_id as NodeId) {
+            if marked[c as usize] {
+                edge_data.push(old_to_new[c as usize]);
+            }
+        }
     }
-    let root = old_to_new[dag.root];
-    Dag { nodes, layers, index, root }
+    edge_start.push(edge_data.len() as u32);
+    let root = old_to_new[dag.root as usize];
+    // NOTE: the pruned DAG's `index` is never read again (get_or_add_node runs only during build),
+    // so we skip rebuilding it — saves ~1.1M hashmap inserts per boundary.
+    Dag { keys, edge_start, edge_data, layers, index: HashMap::new(), root }
 }
 
 /* -------------------------------------------------------------------------- */

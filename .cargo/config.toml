@@ -1,0 +1,8 @@
+# Declare a wasm memory MAXIMUM (the full 4 GiB wasm32 space). This makes V8/Chromium reserve the
+# address space up front and grow the wasm memory IN PLACE, instead of reallocating + copying the
+# whole buffer on every memory.grow. Without a max, Chromium's copy-grow leaves the old buffers
+# around until GC — during the ~1 GB boundary search (many grows) that bloated the tab to 5 GB+ and
+# froze the bot on Windows. Firefox/Safari reserve by default and were never affected. Physical use
+# is unchanged (pages commit on demand); only the (free) virtual reservation grows.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--max-memory=4294967296"]

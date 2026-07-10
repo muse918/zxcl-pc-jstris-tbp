@@ -35,12 +35,22 @@ thread_local! {
 }
 
 /// Allocate a buffer the JS side can fill (returns pointer into wasm linear memory).
+/// Pair every call with free_bytes(ptr, len) — the old mem::forget version leaked each buffer
+/// (KB-scale per TBP message, but a perpetual bot should not leak at all).
 #[no_mangle]
 pub extern "C" fn alloc_bytes(len: usize) -> *mut u8 {
-    let mut v = Vec::<u8>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
+    let layout = std::alloc::Layout::from_size_align(len.max(1), 1).unwrap();
+    unsafe { std::alloc::alloc(layout) }
+}
+
+/// Free a buffer from alloc_bytes; `len` must be the same value passed to alloc_bytes.
+#[no_mangle]
+pub unsafe extern "C" fn free_bytes(p: *mut u8, len: usize) {
+    if p.is_null() {
+        return;
+    }
+    let layout = std::alloc::Layout::from_size_align(len.max(1), 1).unwrap();
+    std::alloc::dealloc(p, layout);
 }
 
 // The projection filter + quantized V* table, zlib-compressed and embedded straight into the wasm

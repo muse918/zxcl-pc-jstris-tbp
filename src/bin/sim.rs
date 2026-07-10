@@ -219,6 +219,13 @@ fn main() {
             "emitted move not a reachable placement: {} {} x{} y{} cells {:?}",
             piece_char(mv.piece), ORIENT_NAMES[mv.orient as usize], mv.x, mv.y, dec
         );
+        // SIM_TRACE=1: one line per placement (bit-exactness regression harness).
+        if std::env::var("SIM_TRACE").map(|s| s != "0").unwrap_or(false) {
+            println!(
+                "T {:4} {} {} x{} y{}",
+                placements, piece_char(mv.piece), ORIENT_NAMES[mv.orient as usize], mv.x, mv.y
+            );
+        }
         let cleared = phys.place(cells4);
 
         // feed play + new_piece(s) like the host
